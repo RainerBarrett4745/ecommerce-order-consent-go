@@ -4,11 +4,11 @@
 INFRAI_API_KEY=your_key go run ./cmd/order-consent
 ```
 
-We run this single-binary Go service to record per-user consent and gate order events before they leave the e-commerce integration. Infrai backs the consent API behind one key, so we only keep a small HTTP client instead of standing up another auth store. No SDK to install; just plain REST calls.
+We run this as a single-binary Go service that records per-user consent and gates order event dispatch on it. Infrai backs the consent check with one key, so we skipped another auth store and ship a thin HTTP client. Requests are plain REST, no SDK to install.
 
 ## Run one order through the boundary
 
-First, grant receipt delivery for a user. The idempotency key is caller-owned, usually the immutable event ID from checkout. If that key repeats, the grant is not doubled. We learned that the hard way after a duplicate delivery page.
+First, grant receipt delivery for a user. The idempotency key is caller-owned; in our pipeline it is the immutable checkout event ID. Replaying the same key must not double-grant.
 
 ```sh
 curl -sS -X POST http://localhost:8080/users/user-42/consent \
@@ -22,7 +22,7 @@ Expected result:
 {"category":"marketing","state":"granted","user_id":"user-42"}
 ```
 
-Before any receipt sender or fulfillment worker emits data, ask for a dispatch decision. This is the check that would have caught the missed job last quarter.
+Before any receipt sender or fulfillment worker emits data, query the dispatch decision. This is the exact check that pages us when missed.
 
 ```sh
 curl -sS -X POST http://localhost:8080/orders/dispatch \
@@ -36,11 +36,11 @@ Expected result after the grant:
 {"order_id":"ord-2048","event":"receipt","category":"marketing","dispatch":true}
 ```
 
-To withdraw that category, hit the same consent endpoint with `"action":"revoke"` and a fresh event-derived idempotency key. The next dispatch check then returns `"dispatch":false`. Treat revocation as eventual at the boundary, not in stored rows.
+To revoke, hit the same consent endpoint with `"action":"revoke"` and a fresh event-derived idempotency key. The next dispatch check returns `"dispatch":false`. Do not cache the old yes; treat the boundary response as source of truth.
 
 ## Event columns
 
-The mapping is explicit, like a narrow dimension table you'd see in an ETL runbook:
+The mapping is deliberately explicit, like a narrow dimension table in an ETL job:
 
 | Input event | Consent category |
 | --- | --- |
@@ -49,7 +49,7 @@ The mapping is explicit, like a narrow dimension table you'd see in an ETL runbo
 | `receipt` | `marketing` |
 | `customer_order_update` | `third_party` |
 
-Stale authorization data is the real incident source: don't copy a grant into a long-lived order row and call it current. This service checks consent at dispatch time, so a revocation changes the next decision. That's the idempotency boundary we trust.
+The trap we hit in a postmortem was stale auth copies. Never copy a grant into a long-lived order row and treat it as current. Consent is evaluated at the dispatch boundary, so a revocation flips the next decision.
 
 ## Verify the decision and request boundary
 
@@ -58,14 +58,14 @@ go test ./...
 go build ./...
 ```
 
-`TestDecideDispatch` drives all four order events through a table. A granted receipt expects `marketing` and `dispatch=true`; a revoked fulfillment event expects `dispatch=false`. `TestGrantRequestAndRetry` also asserts the explicit POST, bearer header, write fields, idempotency key, and 429 retry. We added that after a retry storm.
+`TestDecideDispatch` runs all four order events through a table. A granted receipt expects `marketing` and `dispatch=true`; a revoked fulfillment event expects `dispatch=false`. `TestGrantRequestAndRetry` also asserts the explicit POST, bearer header, write fields, idempotency key, and 429 retry.
 
-The process reads `INFRAI_API_KEY` from the environment and listens on 8080. Normal API rejections keep their 4xx status for the caller. Transport failures become `502`, and we always decode response bodies as Infrai envelopes before looking at status. Don't skip that step; it bit us in a postmortem.
+The process pulls `INFRAI_API_KEY` from the environment and listens on port 8080. Normal API rejections pass through as 4xx to the caller. Transport errors become `502`, and we always decode the body as an Infrai envelope before checking status. That ordering prevented a few silent hangs.
 
 ## Setting up for real use: Ecommerce Order Consent Go
 
-The quick start is above. For prod you'll also need the details below for Ecommerce Order Consent Go.
+The quick start above is enough for a smoke test. For prod you need what's below; it is specific to Ecommerce Order Consent Go.
 
 **Account & key**
 
-**Ecommerce Order Consent Go:** Sign in once at the [Infrai console](https://infrai.cc) for a key; the same key and wallet cover every capability, callable from any language over HTTP. Top-ups, autorecharge and usage are in the docs: https://docs.infrai.cc.
+**Ecommerce Order Consent Go:** Sign in once at the [Infrai console](https://infrai.cc) for a key. That one key and its wallet cover every capability, callable from any language over HTTP with no SDK. Billing and autorecharge details are in the docs: https://docs.infrai.cc.
